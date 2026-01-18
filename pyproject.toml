@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "donor990"
 version = "0.1.0"
-description = "Extract grant recipients from IRS 990 filings"
+description = "Nonprofit grant analysis - extract grant recipients and find donor prospects"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "Carson West", email = "firstwestventures@gmail.com" }
 ]
 keywords = [
     "nonprofit",
@@ -39,6 +39,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+prospect = [
+    "aiohttp>=3.8.0",
+    "beautifulsoup4>=4.11.0",
+    "google-genai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -46,15 +52,19 @@ dev = [
     "mypy>=1.0.0",
     "types-requests>=2.28.0",
 ]
+all = [
+    "donor990[prospect]",
+    "donor990[dev]",
+]
 
 [project.scripts]
 donor990 = "donor990.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/donor990"
-Documentation = "https://github.com/yourusername/donor990#readme"
-Repository = "https://github.com/yourusername/donor990.git"
-Issues = "https://github.com/yourusername/donor990/issues"
+Homepage = "https://github.com/cwestie27/Nonprofit_grants"
+Documentation = "https://github.com/cwestie27/Nonprofit_grants#readme"
+Repository = "https://github.com/cwestie27/Nonprofit_grants.git"
+Issues = "https://github.com/cwestie27/Nonprofit_grants/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/donor990"]

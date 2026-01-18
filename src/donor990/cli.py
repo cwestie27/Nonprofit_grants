@@ -1,6 +1,7 @@
 """Command-line interface for donor990."""
 
 import argparse
+import asyncio
 import csv
 import json
 import logging
@@ -18,29 +19,30 @@ from .parser import Form990Parser
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False, quiet: bool = False):
     """Configure logging."""
-    level = logging.DEBUG if verbose else logging.INFO
+    if quiet:
+        level = logging.ERROR
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
     logging.basicConfig(
         level=level,
         format="%(message)s",
         handlers=[logging.StreamHandler()]
     )
-    # Quiet down requests library
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def load_config(config_path: Path) -> list[str]:
-    """Load EINs from a config file.
-
-    Supports JSON (list or {"eins": [...]}) or plain text (one EIN per line).
-    """
+    """Load EINs from a config file."""
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     content = config_path.read_text().strip()
 
-    # Try JSON first
     if config_path.suffix == ".json" or content.startswith("[") or content.startswith("{"):
         data = json.loads(content)
         if isinstance(data, list):
@@ -50,9 +52,12 @@ def load_config(config_path: Path) -> list[str]:
         else:
             raise ValueError("JSON config must be a list or have an 'eins' key")
 
-    # Plain text: one EIN per line
     return [line.strip() for line in content.splitlines() if line.strip() and not line.startswith("#")]
 
+
+# =============================================================================
+# LOOKUP COMMAND - Extract grant recipients from donor 990 filings
+# =============================================================================
 
 def process_ein(
     ein: str,
@@ -61,21 +66,9 @@ def process_ein(
     parser: Form990Parser,
     verbose: bool = False
 ) -> DonorResult:
-    """Process a single EIN and extract grant recipients.
-
-    Args:
-        ein: Employer Identification Number
-        api: ProPublica API client
-        irs_finder: IRS XML finder
-        parser: Form 990 parser
-        verbose: Whether to print verbose output
-
-    Returns:
-        DonorResult with donor info and recipients
-    """
+    """Process a single EIN and extract grant recipients."""
     ein_clean = ein.replace("-", "")
 
-    # Step 1: Get organization info from ProPublica
     if verbose:
         print(f"\n[Step 1] Fetching organization data from ProPublica...")
 
@@ -93,13 +86,11 @@ def process_ein(
         print(f"    Found: {org_info.get('name', 'Unknown')}")
         print(f"    Location: {org_info.get('city', '')}, {org_info.get('state', '')}")
 
-    # Step 2: Find XML 990 filing
     if verbose:
         print(f"\n[Step 2] Finding XML 990 filing...")
 
     xml_content = None
 
-    # First try ProPublica
     xml_url = api.get_filing_xml_url(org_data)
     if xml_url:
         if verbose:
@@ -113,7 +104,6 @@ def process_ein(
         except requests.RequestException:
             pass
 
-    # If not found, search IRS index
     if not xml_content:
         if verbose:
             print("    Searching IRS TEOS index...")
@@ -156,7 +146,6 @@ def process_ein(
             error="No XML filing available"
         )
 
-    # Step 4: Parse the XML
     if verbose:
         print(f"\n[Step 4] Parsing 990 XML...")
 
@@ -168,7 +157,6 @@ def process_ein(
             error="Could not parse XML"
         )
 
-    # Extract donor info
     donor_info = parser.parse_donor_info(root)
     if verbose:
         print(f"    Form Type: {donor_info.form_type}")
@@ -176,7 +164,6 @@ def process_ein(
         if donor_info.total_grants:
             print(f"    Total Grants: ${donor_info.total_grants:,}")
 
-    # Step 5: Extract grant recipients
     if verbose:
         print(f"\n[Step 5] Extracting grant recipients...")
 
@@ -187,7 +174,7 @@ def process_ein(
     return DonorResult(donor=donor_info, recipients=recipients)
 
 
-def write_csv(results: list[DonorResult], output_path: Path):
+def write_csv(results: list[DonorResult], output_path: Path) -> int:
     """Write results to CSV file."""
     fieldnames = [
         "donor_name", "donor_ein", "donor_city", "donor_state",
@@ -248,58 +235,9 @@ def write_json(results: list[DonorResult], output_path: Path):
         json.dump(data, f, indent=2)
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        prog="donor990",
-        description="Extract grant recipients from IRS 990 filings"
-    )
-
-    parser.add_argument(
-        "eins",
-        nargs="*",
-        help="EIN(s) to process (e.g., 13-1684331)"
-    )
-    parser.add_argument(
-        "-c", "--config",
-        type=Path,
-        help="Path to config file with list of EINs (JSON or text)"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        default=Path("output/donor_grants.csv"),
-        help="Output file path (default: output/donor_grants.csv)"
-    )
-    parser.add_argument(
-        "--format",
-        choices=["csv", "json"],
-        default="csv",
-        help="Output format (default: csv)"
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="Directory to cache downloaded ZIP files"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Verbose output"
-    )
-    parser.add_argument(
-        "-q", "--quiet",
-        action="store_true",
-        help="Quiet mode (minimal output)"
-    )
-
-    args = parser.parse_args()
-
-    # Setup logging
-    if args.quiet:
-        logging.basicConfig(level=logging.ERROR)
-    else:
-        setup_logging(args.verbose)
+def cmd_lookup(args):
+    """Execute the lookup command."""
+    setup_logging(args.verbose, args.quiet)
 
     # Collect EINs
     eins = list(args.eins) if args.eins else []
@@ -313,10 +251,9 @@ def main():
 
     if not eins:
         print("Error: No EINs provided. Use positional arguments or --config file.", file=sys.stderr)
-        parser.print_help()
         sys.exit(1)
 
-    # Remove duplicates while preserving order
+    # Remove duplicates
     seen = set()
     unique_eins = []
     for ein in eins:
@@ -328,7 +265,7 @@ def main():
 
     if not args.quiet:
         print(f"\n{'='*70}")
-        print("DONOR 990 PARSER")
+        print("DONOR 990 LOOKUP")
         print(f"{'='*70}")
         print(f"Processing {len(eins)} EIN(s)")
 
@@ -364,7 +301,7 @@ def main():
     else:
         if output_path.suffix != ".csv":
             output_path = output_path.with_suffix(".csv")
-        total_rows = write_csv(results, output_path)
+        write_csv(results, output_path)
 
     # Summary
     if not args.quiet:
@@ -377,6 +314,162 @@ def main():
         total_recipients = sum(r.total_recipients for r in results)
         print(f"Total recipients: {total_recipients}")
         print(f"Output: {output_path}")
+
+
+# =============================================================================
+# PROSPECT COMMAND - Find similar nonprofits and their donors
+# =============================================================================
+
+def cmd_prospect(args):
+    """Execute the prospect command."""
+    setup_logging(args.verbose, args.quiet)
+
+    try:
+        from .prospector import DonorProspector
+    except ImportError as e:
+        print(f"Error: Missing dependencies for prospect command.", file=sys.stderr)
+        print(f"Install with: pip install donor990[prospect]", file=sys.stderr)
+        print(f"Details: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    nonprofit_name = args.name
+    if not nonprofit_name:
+        print("Error: Please provide a nonprofit name.", file=sys.stderr)
+        sys.exit(1)
+
+    # Create output directory
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prospector = DonorProspector(
+        model=args.model,
+        num_similar=args.num_similar,
+        max_concurrent=args.max_concurrent
+    )
+
+    asyncio.run(prospector.run(
+        nonprofit_name,
+        state=args.state,
+        city=args.city,
+        ein=args.ein,
+        website=args.website,
+        output_dir=str(output_dir)
+    ))
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        prog="donor990",
+        description="Nonprofit grant and donor analysis tools"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # -------------------------------------------------------------------------
+    # LOOKUP subcommand
+    # -------------------------------------------------------------------------
+    lookup_parser = subparsers.add_parser(
+        "lookup",
+        help="Extract grant recipients from donor 990 filings",
+        description="Takes donor EIN(s) and extracts all organizations they gave grants to."
+    )
+    lookup_parser.add_argument(
+        "eins", nargs="*",
+        help="EIN(s) to process (e.g., 13-1684331)"
+    )
+    lookup_parser.add_argument(
+        "-c", "--config", type=Path,
+        help="Path to config file with list of EINs"
+    )
+    lookup_parser.add_argument(
+        "-o", "--output", type=Path, default=Path("output/donor_grants.csv"),
+        help="Output file path (default: output/donor_grants.csv)"
+    )
+    lookup_parser.add_argument(
+        "--format", choices=["csv", "json"], default="csv",
+        help="Output format (default: csv)"
+    )
+    lookup_parser.add_argument(
+        "--cache-dir", type=Path,
+        help="Directory to cache downloaded ZIP files"
+    )
+    lookup_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose output"
+    )
+    lookup_parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Quiet mode"
+    )
+    lookup_parser.set_defaults(func=cmd_lookup)
+
+    # -------------------------------------------------------------------------
+    # PROSPECT subcommand
+    # -------------------------------------------------------------------------
+    prospect_parser = subparsers.add_parser(
+        "prospect",
+        help="Find similar nonprofits and their donors",
+        description="Takes a nonprofit name and finds similar organizations and their donors."
+    )
+    prospect_parser.add_argument(
+        "name", nargs="?",
+        help="Nonprofit name to analyze"
+    )
+    prospect_parser.add_argument(
+        "-s", "--state",
+        help="State abbreviation (e.g., TN, CA)"
+    )
+    prospect_parser.add_argument(
+        "-c", "--city",
+        help="City name"
+    )
+    prospect_parser.add_argument(
+        "-e", "--ein",
+        help="EIN for exact match"
+    )
+    prospect_parser.add_argument(
+        "-w", "--website",
+        help="Official website URL"
+    )
+    prospect_parser.add_argument(
+        "-o", "--output-dir", type=Path, default=Path("output"),
+        help="Output directory (default: output/)"
+    )
+    prospect_parser.add_argument(
+        "--model", default="gemini-2.0-flash",
+        help="LLM model to use (default: gemini-2.0-flash)"
+    )
+    prospect_parser.add_argument(
+        "--num-similar", type=int, default=5,
+        help="Number of similar nonprofits to find (default: 5)"
+    )
+    prospect_parser.add_argument(
+        "--max-concurrent", type=int, default=5,
+        help="Max concurrent requests (default: 5)"
+    )
+    prospect_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose output"
+    )
+    prospect_parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Quiet mode"
+    )
+    prospect_parser.set_defaults(func=cmd_prospect)
+
+    # Parse and execute
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    args.func(args)
 
 
 if __name__ == "__main__":
