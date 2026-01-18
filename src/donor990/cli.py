@@ -344,7 +344,8 @@ def cmd_prospect(args):
     prospector = DonorProspector(
         model=args.model,
         num_similar=args.num_similar,
-        max_concurrent=args.max_concurrent
+        max_concurrent=args.max_concurrent,
+        verbose=args.verbose
     )
 
     asyncio.run(prospector.run(

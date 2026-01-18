@@ -128,6 +128,100 @@ class AsyncProPublicaAPI:
 
 
 # =============================================================================
+# IRS 990 PROFILE EXTRACTOR
+# =============================================================================
+
+class IRS990ProfileExtractor:
+    """Extract nonprofit profile data (mission, programs) from IRS 990 XML."""
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self._finder = None
+        self._parser = None
+
+    @property
+    def finder(self):
+        """Lazy-load IRS XML finder."""
+        if self._finder is None:
+            from ..irs import IRSXMLFinder
+            self._finder = IRSXMLFinder()
+        return self._finder
+
+    @property
+    def parser(self):
+        """Lazy-load Form 990 parser."""
+        if self._parser is None:
+            from ..parser import Form990Parser
+            self._parser = Form990Parser()
+        return self._parser
+
+    def extract_profile(self, ein: str) -> dict:
+        """Extract mission and programs from 990 XML for a given EIN.
+
+        Args:
+            ein: Employer Identification Number
+
+        Returns:
+            Dict with mission_statement, programs, or empty dict if not found
+        """
+        if not ein:
+            return {}
+
+        # Ensure EIN is a string
+        ein = str(ein)
+
+        try:
+            # Find the filing in IRS index
+            if self.verbose:
+                print(f"    [1c] Searching IRS 990 XML for EIN {ein}...")
+
+            filing_info = self.finder.find_filing_info(ein)
+            if not filing_info:
+                if self.verbose:
+                    print(f"        [!] No 990 e-file found for EIN {ein}")
+                return {}
+
+            if self.verbose:
+                print(f"        [OK] Found {filing_info.get('return_type')} for tax year {filing_info.get('tax_period', '')[:4]}")
+
+            # Download the XML
+            xml_content = self.finder.download_xml(filing_info)
+            if not xml_content:
+                if self.verbose:
+                    print(f"        [!] Could not download 990 XML")
+                return {}
+
+            # Parse the XML
+            root = self.parser.parse_xml(xml_content)
+            if root is None:
+                return {}
+
+            # Extract profile data
+            profile_990 = self.parser.parse_nonprofit_profile(root)
+
+            if profile_990.has_data():
+                if self.verbose:
+                    has_mission = "Yes" if profile_990.mission_statement else "No"
+                    num_progs = len(profile_990.programs) if profile_990.programs else 0
+                    print(f"        [OK] Mission: {has_mission}, Programs: {num_progs}")
+
+                return {
+                    "mission_statement": profile_990.mission_statement,
+                    "programs": profile_990.programs,
+                    "source": "IRS 990 XML"
+                }
+            else:
+                if self.verbose:
+                    print(f"        [!] 990 found but no mission/programs extracted")
+                return {}
+
+        except Exception as e:
+            if self.verbose:
+                print(f"        [!] Error extracting 990 profile: {e}")
+            return {}
+
+
+# =============================================================================
 # AI RESEARCH CLIENT
 # =============================================================================
 
@@ -154,8 +248,9 @@ class AIResearcher:
 
     def _research_nonprofit_sync(self, name: str, website: str = None,
                                   existing_profile: NonprofitProfile = None) -> dict:
-        """Synchronous AI research."""
+        """Synchronous AI research with Google Search grounding."""
         from google.genai import types
+        import re
 
         context = ""
         location_hint = ""
@@ -170,35 +265,49 @@ VERIFIED INFORMATION FROM IRS 990 DATA:
 - EIN: {existing_profile.ein}
 {f'- Annual Revenue: ${existing_profile.annual_revenue:,}' if existing_profile.annual_revenue else ''}
 
-IMPORTANT: Research the specific organization{location_hint}.
+Use Google Search to find REAL information about this specific organization.
 """
 
-        prompt = f"""Research this specific nonprofit organization: "{name}"{location_hint}
-{f'Website: {website}' if website else ''}
+        prompt = f"""Use Google Search to research this nonprofit: "{name}"{location_hint}
+{f'Their website is: {website}' if website else ''}
 {context}
 
-Find and return the following in JSON format:
+Search for their official website and find their ACTUAL mission statement, programs, and who they serve.
+Do NOT make up or infer information - only report what you find from real sources.
+
+Return the following as JSON:
 {{
-    "mission_statement": "Their EXACT official mission statement if you can find it, otherwise null",
-    "programs": ["List", "of", "specific", "programs"],
-    "population_served": "Specifically who they serve",
-    "impact_statement": "Key impact metrics or outcomes",
+    "mission_statement": "Their EXACT official mission statement from their website, or null if not found",
+    "programs": ["Actual", "program", "names", "from", "their", "website"],
+    "population_served": "Who they actually serve according to their website",
+    "impact_statement": "Real impact metrics or outcomes if available, otherwise null",
     "website": "Their official website URL",
-    "founding_year": null or year as integer
+    "founding_year": null or year as integer if found
 }}
 
-Return ONLY valid JSON."""
+Return ONLY valid JSON, no other text."""
 
         try:
+            # Enable Google Search grounding for real-time web search
+            grounding_tool = types.Tool(google_search=types.GoogleSearch())
+
             response = self.client.models.generate_content(
                 model=self.model,
                 contents=[prompt],
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.2
+                    tools=[grounding_tool],
+                    temperature=0.1
                 )
             )
-            result = json.loads(response.text)
+
+            # Extract JSON from response (may have additional text with grounding)
+            response_text = response.text
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                result = json.loads(response_text)
+
             if isinstance(result, list):
                 result = result[0] if result else {}
             return result
@@ -630,10 +739,12 @@ class DonorProspector:
 
     def __init__(self, model: str = DEFAULT_LLM_MODEL,
                  num_similar: int = DEFAULT_NUM_SIMILAR,
-                 max_concurrent: int = DEFAULT_MAX_CONCURRENT):
+                 max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+                 verbose: bool = False):
         self.model = model
         self.num_similar = num_similar
         self.max_concurrent = max_concurrent
+        self.verbose = verbose
         self.propublica = None
         self.ai_researcher = None
         self.scraper = None
@@ -749,26 +860,72 @@ class DonorProspector:
         if website:
             profile.website = website
 
-        # Step 1b: AI Research
-        print("    [1b] AI research...")
-        ai_results = await self.ai_researcher.research_nonprofit(
-            name=profile.name, website=profile.website, existing_profile=profile
+        # Step 1b: Try IRS 990 XML first (authoritative source)
+        irs_990_results = {}
+        if profile.ein:
+            print("    [1b] IRS 990 XML lookup...")
+            irs_extractor = IRS990ProfileExtractor(verbose=self.verbose)
+            irs_990_results = irs_extractor.extract_profile(profile.ein)
+
+            if irs_990_results.get("mission_statement"):
+                print(f"        [OK] Found mission from IRS 990")
+                profile.mission_statement = irs_990_results.get("mission_statement")
+                if profile.data_sources:
+                    profile.data_sources.append("IRS 990 XML")
+                else:
+                    profile.data_sources = ["IRS 990 XML"]
+
+            if irs_990_results.get("programs"):
+                print(f"        [OK] Found {len(irs_990_results['programs'])} programs from IRS 990")
+                profile.programs = irs_990_results.get("programs")
+        else:
+            print("    [1b] No EIN - skipping IRS 990 lookup")
+
+        # Step 1c: AI Research (fallback for missing data)
+        # Only use AI if we don't have mission or need population_served
+        needs_ai = (
+            not profile.mission_statement or
+            not profile.programs or
+            not profile.population_served
         )
 
-        if ai_results:
-            print(f"        [OK] Found mission, programs, population")
-            profile.mission_statement = ai_results.get("mission_statement")
-            profile.programs = ai_results.get("programs")
-            profile.population_served = ai_results.get("population_served")
-            profile.impact_statement = ai_results.get("impact_statement")
-            if profile.ntee_description:
-                profile.cause_area = profile.ntee_description
-            if not profile.website and ai_results.get("website"):
-                profile.website = ai_results.get("website")
-            if profile.data_sources:
-                profile.data_sources.append("AI Research")
-            else:
-                profile.data_sources = ["AI Research"]
+        if needs_ai:
+            print("    [1c] AI research (Google-grounded)...")
+            ai_results = await self.ai_researcher.research_nonprofit(
+                name=profile.name, website=profile.website, existing_profile=profile
+            )
+
+            if ai_results:
+                # Only fill in what we don't already have from 990
+                if not profile.mission_statement and ai_results.get("mission_statement"):
+                    print(f"        [OK] Found mission from AI")
+                    profile.mission_statement = ai_results.get("mission_statement")
+
+                if not profile.programs and ai_results.get("programs"):
+                    print(f"        [OK] Found programs from AI")
+                    profile.programs = ai_results.get("programs")
+
+                # Always get population_served from AI (not in 990)
+                if ai_results.get("population_served"):
+                    print(f"        [OK] Found population served from AI")
+                    profile.population_served = ai_results.get("population_served")
+
+                if ai_results.get("impact_statement"):
+                    profile.impact_statement = ai_results.get("impact_statement")
+
+                if profile.ntee_description:
+                    profile.cause_area = profile.ntee_description
+
+                if not profile.website and ai_results.get("website"):
+                    profile.website = ai_results.get("website")
+
+                if profile.data_sources:
+                    if "AI Research" not in profile.data_sources:
+                        profile.data_sources.append("AI Research (Google-grounded)")
+                else:
+                    profile.data_sources = ["AI Research (Google-grounded)"]
+        else:
+            print("    [1c] Skipping AI - have mission and programs from 990")
 
         return profile
 

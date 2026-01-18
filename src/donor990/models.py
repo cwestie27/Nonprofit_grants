@@ -54,3 +54,22 @@ class DonorResult:
     @property
     def total_amount(self) -> int:
         return sum(r.amount or 0 for r in self.recipients)
+
+
+@dataclass
+class Form990Profile:
+    """Profile data extracted from Form 990 XML (mission, programs, etc.)."""
+    mission_statement: Optional[str] = None
+    programs: Optional[list[str]] = None
+    program_expenses: Optional[list[int]] = None
+    total_revenue: Optional[int] = None
+    total_expenses: Optional[int] = None
+    tax_year: Optional[int] = None
+
+    def has_data(self) -> bool:
+        """Check if any meaningful data was extracted."""
+        return bool(self.mission_statement or self.programs)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary."""
+        return asdict(self)

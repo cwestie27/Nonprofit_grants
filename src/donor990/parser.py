@@ -5,7 +5,7 @@ from typing import Optional
 
 from lxml import etree
 
-from .models import DonorInfo, GrantRecipient
+from .models import DonorInfo, GrantRecipient, Form990Profile
 
 logger = logging.getLogger(__name__)
 
@@ -269,3 +269,63 @@ class Form990Parser:
             except ValueError:
                 return None
         return None
+
+    def parse_nonprofit_profile(self, root: etree._Element) -> Form990Profile:
+        """Extract nonprofit profile data (mission, programs) from 990 XML.
+
+        Args:
+            root: Parsed XML root element
+
+        Returns:
+            Form990Profile with mission statement and program descriptions
+        """
+        # Get mission statement (Part I, Line 1)
+        mission = (
+            self._get_text(root, ".//irs:ActivityOrMissionDesc") or
+            self._get_text(root, ".//irs:MissionDesc") or
+            self._get_text(root, ".//irs:PrimaryExemptPurposeTxt")
+        )
+
+        # Get program descriptions (Part III)
+        # Programs are in Desc elements within the IRS990 section
+        programs = []
+        program_expenses = []
+
+        # Try ProgramServiceAccomplishmentGrp first (standard 990)
+        prog_groups = root.findall(".//irs:ProgramServiceAccomplishmentGrp", self.NAMESPACES)
+        for prog in prog_groups:
+            desc = self._get_text(prog, ".//irs:DescriptionProgramSrvcAccomTxt")
+            if desc:
+                programs.append(desc)
+                expenses = self._get_int(prog, ".//irs:TotalExpensesAmt")
+                program_expenses.append(expenses or 0)
+
+        # If no programs found, try Desc elements directly under IRS990
+        if not programs:
+            irs990 = root.find(".//irs:IRS990", self.NAMESPACES)
+            if irs990 is not None:
+                for desc_elem in irs990.findall(".//irs:Desc", self.NAMESPACES):
+                    if desc_elem.text and len(desc_elem.text.strip()) > 30:
+                        programs.append(desc_elem.text.strip())
+
+        # Get financial info
+        total_revenue = (
+            self._get_int(root, ".//irs:CYTotalRevenueAmt") or
+            self._get_int(root, ".//irs:TotalRevenueAmt")
+        )
+        total_expenses = (
+            self._get_int(root, ".//irs:CYTotalExpensesAmt") or
+            self._get_int(root, ".//irs:TotalExpensesAmt")
+        )
+
+        # Get tax year
+        tax_year = self._get_text(root, ".//irs:TaxYr")
+
+        return Form990Profile(
+            mission_statement=mission,
+            programs=programs if programs else None,
+            program_expenses=program_expenses if program_expenses else None,
+            total_revenue=total_revenue,
+            total_expenses=total_expenses,
+            tax_year=int(tax_year) if tax_year else None
+        )
